@@ -4,19 +4,22 @@
     <meta charset="UTF-8">
     <title>Brave Fingerprint Single Verifier</title>
     <style>
-        /* 文字サイズを絶対値(px)で指定し、ブラウザ設定に依存しないように修正 */
+        /* 文字サイズを絶対値(px)で指定し、ブラウザ設定に依存しないように再修正 */
         body { 
             font-family: monospace; 
             padding: 30px; 
             background-color: #f4f4f4; 
-            font-size: 24px; /* 1.5倍に相当する24pxで固定 */
+            font-size: 20px; /* 全体の基準となるフォントサイズを20pxに固定 */
         } 
         h1 { 
             color: #333; 
-            font-size: 30px; /* 見出しを少し大きく */
+            font-size: 28px; /* 見出し1 */
         }
         h2 { 
-            font-size: 24px; 
+            font-size: 22px; /* 見出し2 */
+        }
+        p { /* 段落のフォントサイズも明示 */
+            font-size: 18px; 
         }
         button { 
             font-size: 18px; /* ボタン内の文字サイズ */
@@ -31,7 +34,7 @@
             border: 2px solid #ddd; 
             white-space: pre-wrap; 
             word-break: break-all;
-            font-size: 18px; /* ログエリアは少し小さめに固定 */
+            font-size: 16px; /* ログエリアのフォントサイズを16pxに固定 */
         } 
         .hash-changed { color: red; font-weight: bold; }
     </style>
