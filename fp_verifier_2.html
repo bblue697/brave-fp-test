@@ -32,6 +32,11 @@
             white-space: pre-wrap;
             word-break: break-all;
             font-size: 16px; /* ログエリアのフォントサイズを16pxに固定 */
+            
+            /* ↓↓↓ AndroidのBraveでの文字の異常拡大を防ぐ修正 ↓↓↓ */
+            -webkit-text-size-adjust: 100%; 
+            text-size-adjust: 100%;        
+            /* ↑↑↑ 修正ここまで ↑↑↑ */
         }
     </style>
 </head>
