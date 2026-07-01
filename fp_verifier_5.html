@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8" />
+    <title>Brave Farbling Verifier 5</title>
+    <style>
+        html { font-size: 150%; }
+        body {
+            font-family: monospace;
+            padding: 30px;
+            background-color: #f4f4f4;
+            font-size: 1rem;
+        }
+        h1 { color: #333; font-size: 1.4rem; }
+        p { font-size: 0.9rem; }
+        button {
+            font-size: 0.75rem;
+            padding: 10px 20px;
+            margin-right: 15px;
+            cursor: pointer;
+        }
+        #output {
+            background-color: #fff;
+            padding: 20px;
+            border: 2px solid #ddd;
+            white-space: pre-wrap;
+            word-break: break-all;
+            font-size: 0.8rem;
+            -webkit-text-size-adjust: 100%;
+            text-size-adjust: 100%;
+        }
+    </style>
+</head>
+<body>
+    <h1>Brave Farbling Verifier 5 (多条件差分観測版)</h1>
+    <p>Canvas / Audio(3経路) / WebGL(3フレーム) を個別にハッシュ化し、どこで差分が出るかを観測します。文字サイズは変更していません。</p>
+    <p style="color:#900;">方針: 単一ハッシュで「変わった/変わらない」だけを見るのではなく、条件ごとに個別ハッシュを出し、どのAPI・どのノード構成で差が出るかを比較できるようにしています。</p>
+
+    <button id="run1">測定開始 (1回)</button>
+    <button id="run3">測定開始 (3回連続)</button>
+    <button id="copy">測定結果をコピー</button>
+    <hr>
+
+    <h2>測定結果ログ</h2>
+    <pre id="output">測定ボタンを押してください...</pre>
+
+    <script>
+    function bufToHex(buffer) {
+        return Array.from(new Uint8Array(buffer))
+            .map(b => b.toString(16).padStart(2,'0'))
+            .join('');
+    }
+    async function sha256Hex(buffer) {
+        const h = await crypto.subtle.digest('SHA-256', buffer);
+        return bufToHex(h);
+    }
+
+    async function getCanvasFingerprint() {
+        try {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = 600;
+            canvas.height = 120;
+            ctx.clearRect(0,0,canvas.width,canvas.height);
+            ctx.textBaseline = "top";
+            ctx.font = "24px 'Arial', sans-serif";
+            ctx.fillStyle = "#f60";
+            ctx.fillRect(100, 1, 160, 40);
+            ctx.shadowBlur = 4;
+            ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
+            ctx.fillStyle = "#069";
+            ctx.fillText("Brave Farbling Test 🚀 - Verifier 5", 10, 28);
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = "#333";
+            ctx.font = "16px monospace";
+            ctx.fillText("canvas", 5, 5);
+            const img = ctx.getImageData(0,0, canvas.width, canvas.height);
+            return { combined: await sha256Hex(img.data.buffer) };
+        } catch (e) {
+            console.error('Canvas error', e);
+            return { combined: "Canvas_Error: " + e.message };
+        }
+    }
+
+    async function getAudioFingerprint() {
+        try {
+            const Ctx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+            if (!Ctx) return { combined: "Audio_Not_Available" };
+            const sampleRate = 44100;
+            const length = sampleRate * 1;
+
+            async function buildGraph(type) {
+                const ctx = new Ctx(1, length, sampleRate);
+                const osc = ctx.createOscillator();
+                osc.frequency.setValueAtTime(440, ctx.currentTime);
+                if (type === 'A') {
+                    osc.type = 'sine';
+                    osc.connect(ctx.destination);
+                } else if (type === 'B') {
+                    osc.type = 'triangle';
+                    const comp = ctx.createDynamicsCompressor();
+                    if (comp.threshold) comp.threshold.setValueAtTime(-50, ctx.currentTime);
+                    if (comp.knee) comp.knee.setValueAtTime(40, ctx.currentTime);
+                    if (comp.ratio) comp.ratio.setValueAtTime(12, ctx.currentTime);
+                    osc.connect(comp);
+                    comp.connect(ctx.destination);
+                } else if (type === 'C') {
+                    osc.type = 'square';
+                    const filter = ctx.createBiquadFilter();
+                    filter.type = 'lowpass';
+                    filter.frequency.setValueAtTime(8000, ctx.currentTime);
+                    osc.connect(filter);
+                    filter.connect(ctx.destination);
+                }
+                osc.start(0);
+                const rendered = await ctx.startRendering();
+                return rendered.getChannelData(0);
+            }
+
+            const [dataA, dataB, dataC] = await Promise.all([
+                buildGraph('A'), buildGraph('B'), buildGraph('C')
+            ]);
+            const hashA = await sha256Hex(dataA.buffer);
+            const hashB = await sha256Hex(dataB.buffer);
+            const hashC = await sha256Hex(dataC.buffer);
+            const combined = new Float32Array(dataA.length + dataB.length + dataC.length);
+            combined.set(dataA, 0);
+            combined.set(dataB, dataA.length);
+            combined.set(dataC, dataA.length + dataB.length);
+            const hashCombined = await sha256Hex(combined.buffer);
+            return {
+                combined: hashCombined,
+                pathA_sine: hashA,
+                pathB_triangle_compressor: hashB,
+                pathC_square_filter: hashC
+            };
+        } catch (e) {
+            console.error('Audio error', e);
+            return { combined: "Audio_Error: " + e.message };
+        }
+    }
+
+    async function getWebGLFingerprint() {
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64;
+            canvas.height = 64;
+            const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+            if (!gl) return { combined: "WebGL_Not_Available" };
+
+            function compileShader(type, src) {
+                const shader = gl.createShader(type);
+                gl.shaderSource(shader, src);
+                gl.compileShader(shader);
+                if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                    throw new Error('Shader compile error: ' + gl.getShaderInfoLog(shader));
+                }
+                return shader;
+            }
+
+            const vsSource = `
+                attribute vec2 aPosition;
+                varying vec2 vPos;
+                void main() {
+                    vPos = aPosition;
+                    gl_Position = vec4(aPosition, 0.0, 1.0);
+                }
+            `;
+            const fsSource = `
+                precision mediump float;
+                varying vec2 vPos;
+                uniform float seed;
+                void main() {
+                    float r = 0.5 + 0.5 * sin(vPos.x * 12.9898 + vPos.y * 78.233 + seed);
+                    float g = 0.5 + 0.5 * cos(vPos.x * 39.346 + vPos.y * 11.135 + seed * 1.7);
+                    float b = 0.5 + 0.5 * sin((vPos.x + vPos.y) * 24.5 + seed * 2.3);
+                    gl_FragColor = vec4(r, g, b, 1.0);
+                }
+            `;
+
+            const vs = compileShader(gl.VERTEX_SHADER, vsSource);
+            const fs = compileShader(gl.FRAGMENT_SHADER, fsSource);
+            const program = gl.createProgram();
+            gl.attachShader(program, vs);
+            gl.attachShader(program, fs);
+            gl.linkProgram(program);
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                throw new Error('Program link error: ' + gl.getProgramInfoLog(program));
+            }
+            gl.useProgram(program);
+
+            const vertices = new Float32Array([
+                -1, -1,  1, -1,  -1, 1,
+                -1,  1,  1, -1,   1, 1,
+            ]);
+            const vertexBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+            const aPosition = gl.getAttribLocation(program, 'aPosition');
+            gl.enableVertexAttribArray(aPosition);
+            gl.vertexAttribPointer(aPosition, 2, gl.FLOAT, false, 0, 0);
+            gl.viewport(0, 0, canvas.width, canvas.height);
+
+            const uSeed = gl.getUniformLocation(program, 'seed');
+
+            function renderFrame(seedValue) {
+                gl.clearColor(0.0, 0.0, 0.0, 1.0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                gl.uniform1f(uSeed, seedValue);
+                gl.drawArrays(gl.TRIANGLES, 0, 6);
+                gl.finish();
+                const px = new Uint8Array(canvas.width * canvas.height * 4);
+                gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, px);
+                return px;
+            }
+
+            const frame1 = renderFrame(1.0);
+            const frame2 = renderFrame(2.0);
+            const frame3 = renderFrame(3.0);
+            const hash1 = await sha256Hex(frame1.buffer);
+            const hash2 = await sha256Hex(frame2.buffer);
+            const hash3 = await sha256Hex(frame3.buffer);
+
+            const params = [
+                gl.getParameter(gl.VENDOR),
+                gl.getParameter(gl.RENDERER),
+                gl.getParameter(gl.VERSION),
+                gl.getParameter(gl.SHADING_LANGUAGE_VERSION)
+            ].map(v => (v || '').toString()).join('|');
+
+            let unmasked = '';
+            try {
+                const dbgInfo = gl.getExtension('WEBGL_debug_renderer_info');
+                if (dbgInfo) {
+                    unmasked = [
+                        gl.getParameter(dbgInfo.UNMASKED_VENDOR_WEBGL),
+                        gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL)
+                    ].map(v => (v || '').toString()).join('|');
+                }
+            } catch (e) {}
+            const paramsHash = await sha256Hex(new TextEncoder().encode(params + '||' + unmasked));
+
+            const merged = new Uint8Array(frame1.length + frame2.length + frame3.length);
+            merged.set(frame1, 0);
+            merged.set(frame2, frame1.length);
+            merged.set(frame3, frame1.length + frame2.length);
+            const hashCombined = await sha256Hex(merged.buffer);
+
+            return {
+                combined: hashCombined,
+                frame_seed1: hash1,
+                frame_seed2: hash2,
+                frame_seed3: hash3,
+                vendor_renderer_params: paramsHash
+            };
+        } catch (e) {
+            console.error('WebGL error', e);
+            return { combined: "WebGL_Error: " + e.message };
+        }
+    }
+
+    async function sampleFingerprint() {
+        const fp = {};
+        fp.ts = (new Date()).toISOString();
+        const [canvasR, audioR, webglR] = await Promise.all([
+            getCanvasFingerprint(), getAudioFingerprint(), getWebGLFingerprint()
+        ]);
+        fp.canvas = canvasR;
+        fp.audio = audioR;
+        fp.webgl = webglR;
+        fp.hardwareConcurrency_masked = window.navigator.hardwareConcurrency || 'unknown';
+        fp.deviceMemory_masked = window.navigator.deviceMemory || 'unknown';
+        return fp;
+    }
+
+    const log = [];
+    const outputEl = document.getElementById('output');
+
+    async function runTestAndDisplay(note, repeats=1, delayMs=150) {
+        log.length = 0;
+        for (let i=0;i<repeats;i++){
+            const fp = await sampleFingerprint();
+            fp.note = repeats===1 ? note : `${note} (${i+1}/${repeats})`;
+            log.push(fp);
+            if (i < repeats-1) await new Promise(r => setTimeout(r, delayMs));
+        }
+        renderOutput();
+    }
+
+    function renderOutput() {
+        let outputText = `--- ${document.title} ---`;
+        log.forEach((entry, index) => {
+            outputText += `\n\n[${index + 1}] ${entry.note}\n`;
+            outputText += `  日時: ${entry.ts}\n`;
+            outputText += `  --- Canvas ---\n`;
+            outputText += `  Canvas SHA-256: ${entry.canvas.combined}\n`;
+            outputText += `  --- Audio (3経路) ---\n`;
+            outputText += `  Audio 結合SHA-256: ${entry.audio.combined}\n`;
+            if (entry.audio.pathA_sine) {
+                outputText += `    経路A(sine単体): ${entry.audio.pathA_sine}\n`;
+                outputText += `    経路B(triangle+compressor): ${entry.audio.pathB_triangle_compressor}\n`;
+                outputText += `    経路C(square+lowpass filter): ${entry.audio.pathC_square_filter}\n`;
+            }
+            outputText += `  --- WebGL (3フレーム) ---\n`;
+            outputText += `  WebGL 結合SHA-256: ${entry.webgl.combined}\n`;
+            if (entry.webgl.frame_seed1) {
+                outputText += `    フレーム(seed=1): ${entry.webgl.frame_seed1}\n`;
+                outputText += `    フレーム(seed=2): ${entry.webgl.frame_seed2}\n`;
+                outputText += `    フレーム(seed=3): ${entry.webgl.frame_seed3}\n`;
+                outputText += `    VENDOR/RENDERER文字列ハッシュ: ${entry.webgl.vendor_renderer_params}\n`;
+            }
+            outputText += `  CPU Cores: ${entry.hardwareConcurrency_masked}\n`;
+            outputText += `  RAM (GB): ${entry.deviceMemory_masked}\n`;
+        });
+        outputEl.innerText = outputText;
+    }
+
+    document.getElementById('run1').addEventListener('click', () => runTestAndDisplay('Single Measurement', 1));
+    document.getElementById('run3').addEventListener('click', () => runTestAndDisplay('Triple Measurement', 3, 250));
+    document.getElementById('copy').addEventListener('click', async () => {
+        const text = outputEl.innerText;
+        if (!navigator.clipboard) {
+            alert('クリップボードAPIがサポートされていません。手動でコピーしてください。');
+            return;
+        }
+        try {
+            await navigator.clipboard.writeText(text);
+            alert('測定結果をクリップボードにコピーしました！');
+        } catch (e) {
+            console.error('コピー失敗', e);
+            alert('コピーに失敗しました。');
+        }
+    });
+    </script>
+</body>
+</html>
