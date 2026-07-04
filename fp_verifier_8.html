@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8" />
+    <title>Brave Farbling Verifier 8 (高識別力WebGL診断版＋追加テスト)</title>
+    <style>
+        html { font-size: 150%; }
+        body {
+            font-family: monospace;
+            padding: 30px;
+            background-color: #f4f4f4;
+            font-size: 1rem;
+        }
+        h1 { color: #333; font-size: 1.3rem; }
+        h2 { font-size: 1.05rem; margin-top: 25px; }
+        p { font-size: 0.85rem; }
+        button {
+            font-size: 0.75rem;
+            padding: 10px 20px;
+            margin-right: 15px;
+            cursor: pointer;
+        }
+        #output {
+            background-color: #fff;
+            padding: 20px;
+            border: 2px solid #ddd;
+            white-space: pre-wrap;
+            word-break: break-all;
+            font-size: 0.78rem;
+            -webkit-text-size-adjust: 100%;
+            text-size-adjust: 100%;
+        }
+        .note { color: #900; font-size: 0.8rem; }
+    </style>
+</head>
+<body>
+    <h1>Brave Farbling Verifier 8 (高識別力WebGL診断版＋追加テスト)</h1>
+    <p>
+        従来版(sin/cos単純計算)では機種間で差が出なかったため、GPUアーキテクチャ・コンパイラの実装差が
+        出やすいとされる複数の手法(レンジリダクション暴露・誤差増幅・highp/mediump比較・近似命令・
+        偏微分・精度クエリ・テクスチャサンプリング・反復増幅・精度比較)を並行して測定します。
+    </p>
+    <p class="note">
+        注意: これらの手法を使っても機種間で差が出ない場合、その機種群は本当に同一のシェーダーコンパイラ
+        実装を共有している可能性が高いことの、さらに強い証拠になります。
+    </p>
+
+    <button id="run1">測定開始 (1回)</button>
+    <button id="run3">測定開始 (3回連続)</button>
+    <button id="copy">測定結果をコピー</button>
+    <hr>
+
+    <h2>測定結果ログ</h2>
+    <pre id="output">測定ボタンを押してください...</pre>
+
+    <script>
+    function bufToHex(buffer) {
+        return Array.from(new Uint8Array(buffer))
+            .map(b => b.toString(16).padStart(2,'0'))
+            .join('');
+    }
+    async function sha256Hex(buffer) {
+        const h = await crypto.subtle.digest('SHA-256', buffer);
+        return bufToHex(h);
+    }
+
+    // =====================
+    // 共通ユーティリティ: 1枚のテスト用シェーダーを描画してピクセル取得
+    // =====================
+    function runShaderTest(gl, canvas, fsSource, vsSource, uniformsSetup) {
+        function compileShader(type, src) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, src);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                throw new Error('Shader compile error: ' + gl.getShaderInfoLog(shader));
+            }
+            return shader;
+        }
+        const vs = compileShader(gl.VERTEX_SHADER, vsSource);
+        const fs = compileShader(gl.FRAGMENT_SHADER, fsSource);
+        const program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            throw new Error('Program link error: ' + gl.getProgramInfoLog(program));
+        }
+        gl.useProgram(program);
+
+        const vertices = new Float32Array([
+            -1,-1,  1,-1, -1, 1,
+            -1, 1,  1,-1,  1, 1
+        ]);
+        const vertexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+        const aPosition = gl.getAttribLocation(program, 'aPosition');
+        gl.enableVertexAttribArray(aPosition);
+        gl.vertexAttribPointer(aPosition, 2, gl.FLOAT, false, 0, 0);
+
+        if (uniformsSetup) {
+            uniformsSetup(gl, program);
+        }
+
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+        gl.finish();
+
+        const px = new Uint8Array(canvas.width * canvas.height * 4);
+        gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, px);
+
+        gl.deleteProgram(program);
+        gl.deleteShader(vs);
+        gl.deleteShader(fs);
+        gl.deleteBuffer(vertexBuffer);
+        return px;
+    }
+
+    const VS_COMMON = `
+        attribute vec2 aPosition;
+        varying vec2 vPos;
+        void main() {
+            vPos = aPosition;
+            gl_Position = vec4(aPosition, 0.0, 1.0);
+        }
+    `;
+
+    // =====================
+    // テスト①: 従来版(基準・比較用)
+    // =====================
+    const FS_BASELINE = `
+        precision mediump float;
+        varying vec2 vPos;
+        void main() {
+            float r = 0.5 + 0.5 * sin(vPos.x * 12.9898 + vPos.y * 78.233);
+            float g = 0.5 + 0.5 * cos(vPos.x * 39.346 + vPos.y * 11.135);
+            float b = 0.5 + 0.5 * sin((vPos.x + vPos.y) * 24.5);
+            gl_FragColor = vec4(r, g, b, 1.0);
+        }
+    `;
+
+    // =====================
+    // テスト②: レンジリダクション暴露(巨大な引数のsin/cos)
+    // =====================
+    const FS_RANGE_REDUCTION = `
+        precision highp float;
+        varying vec2 vPos;
+        void main() {
+            float x = (vPos.x + 2.0) * 1.0e6 + (vPos.y + 2.0) * 3.7e6;
+            float r = 0.5 + 0.5 * sin(x);
+            float g = 0.5 + 0.5 * cos(x * 1.3);
+            float b = 0.5 + 0.5 * sin(x * 0.7 + 1.0);
+            gl_FragColor = vec4(r, g, b, 1.0);
+        }
+    `;
+
+    // =====================
+    // テスト③: 誤差増幅(小数点以下の違いをfractで可視化, highp)
+    // =====================
+    const FS_AMPLIFIED = `
+        precision highp float;
+        varying vec2 vPos;
+        void main() {
+            float raw = sin(vPos.x * 12.9898) * cos(vPos.y * 78.233) * 43758.5453;
+            float amp = fract(raw * 1000.0);
+            float r = amp;
+            float g = fract(raw * 7919.0);
+            float b = fract((raw + 1.0) * 104729.0);
+            gl_FragColor = vec4(r, g, b, 1.0);
+        }
+    `;
+
+    // =====================
+    // テスト④: mediump精度パスの単独抽出(highpとの差分用)
+    // =====================
+    const FS_MEDIUMP_ONLY = `
+        precision mediump float;
+        varying vec2 vPos;
+        void main() {
+            float raw = sin(vPos.x * 12.9898) * cos(vPos.y * 78.233) * 43758.5453;
+            float amp = fract(raw * 1000.0);
+            float r = amp;
+            float g = fract(raw * 7919.0);
+            float b = fract((raw + 1.0) * 104729.0);
+            gl_FragColor = vec4(r, g, b, 1.0);
+        }
+    `;
+
+    // =====================
+    // テスト⑤: 高速近似命令(pow, exp, log, inversesqrt)
+    // =====================
+    const FS_FAST_APPROX = `
+        precision highp float;
+        varying vec2 vPos;
+        void main() {
+            float x = abs(vPos.x) + 0.01;
+            float y = abs(vPos.y) + 0.01;
+            float r = fract(pow(x, 2.71828) * 1000.0);
+            float g = fract(exp(y * 3.0) * 1000.0);
+            float b = fract(inversesqrt(x + y) * 1000.0);
+            gl_FragColor = vec4(r, g, b, 1.0);
+        }
+    `;
+
+    // =====================
+    // テスト⑥: 画面空間偏微分(dFdx/dFdy)
+    // =====================
+    function buildDerivativeShader(gl) {
+        const ext = gl.getExtension('OES_standard_derivatives');
+        const extLine = ext ? '#extension GL_OES_standard_derivatives : enable\n' : '';
+        return {
+            available: !!ext,
+            source: extLine + `
+                precision highp float;
+                varying vec2 vPos;
+                void main() {
+                    float base = sin(vPos.x * 50.0) * cos(vPos.y * 50.0);
+                    float dx = dFdx(base);
+                    float dy = dFdy(base);
+                    float r = fract((dx + 1.0) * 5000.0);
+                    float g = fract((dy + 1.0) * 5000.0);
+                    float b = fract((dx * dy + 1.0) * 5000.0);
+                    gl_FragColor = vec4(r, g, b, 1.0);
+                }
+            `
+        };
+    }
+
+    // =====================
+    // 追加テスト⑦: テクスチャサンプリング
+    // =====================
+    const FS_TEXTURE_SAMPLE = `
+        precision highp float;
+        varying vec2 vPos;
+        uniform sampler2D uTex;
+        void main() {
+            vec2 uv = vPos * 0.5 + 0.5;
+            vec4 t = texture2D(uTex, uv);
+            float r = fract((t.r * 1.731 + t.g * 2.113 + t.b * 3.917) * 1000.0);
+            float g = fract((t.r * 4.271 - t.g * 1.337 + t.b * 0.619) * 1000.0);
+            float b = fract((t.r * 0.887 + t.g * 5.113 - t.b * 2.771) * 1000.0);
+            gl_FragColor = vec4(r, g, b, 1.0);
+        }
+    `;
+
+    function createSmallNoiseTexture(gl) {
+        const size = 8;
+        const data = new Uint8Array(size * size * 4);
+        for (let i = 0; i < data.length; i += 4) {
+            data[i + 0] = (i * 17 + 13) & 255;
+            data[i + 1] = (i * 31 + 7) & 255;
+            data[i + 2] = (i * 61 + 3) & 255;
+            data[i + 3] = 255;
+        }
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        return tex;
+    }
+
+    // =====================
+    // 追加テスト⑧: 反復増幅パス
+    // =====================
+    const FS_ITERATIVE = `
+        precision highp float;
+        varying vec2 vPos;
+        void main() {
+            vec3 c = vec3(vPos * 0.5 + 0.5, 0.5);
+            for (int i = 0; i < 32; i++) {
+                c = fract(c * 1.731 + vec3(0.137, 0.271, 0.419));
+                c = abs(c - 0.5) * 2.0;
+                c = pow(c, vec3(1.7, 1.9, 2.1));
+            }
+            gl_FragColor = vec4(c, 1.0);
+        }
+    `;
+
+    // =====================
+    // 追加テスト⑨: highp / mediump 完全対比較
+    // =====================
+    const FS_PRECISION_COMPARE_HIGHP = `
+        precision highp float;
+        varying vec2 vPos;
+        void main() {
+            float x = vPos.x * 123.456 + vPos.y * 789.012;
+            float y = sin(x) * cos(x * 1.2345) * 43758.5453;
+            float r = fract(y * 1000.0);
+            float g = fract(y * 7919.0);
+            float b = fract((y + 1.0) * 104729.0);
+            gl_FragColor = vec4(r, g, b, 1.0);
+        }
+    `;
+
+    const FS_PRECISION_COMPARE_MEDIUMP = `
+        precision mediump float;
+        varying vec2 vPos;
+        void main() {
+            float x = vPos.x * 123.456 + vPos.y * 789.012;
+            float y = sin(x) * cos(x * 1.2345) * 43758.5453;
+            float r = fract(y * 1000.0);
+            float g = fract(y * 7919.0);
+            float b = fract((y + 1.0) * 104729.0);
+            gl_FragColor = vec4(r, g, b, 1.0);
+        }
+    `;
+
+    // =====================
+    // シェーダー精度フォーマットの直接クエリ
+    // =====================
+    function getPrecisionInfo(gl) {
+        const result = {};
+        const shaderTypes = [
+            ['VERTEX_SHADER', gl.VERTEX_SHADER],
+            ['FRAGMENT_SHADER', gl.FRAGMENT_SHADER]
+        ];
+        const precTypes = [
+            ['LOW_FLOAT', gl.LOW_FLOAT],
+            ['MEDIUM_FLOAT', gl.MEDIUM_FLOAT],
+            ['HIGH_FLOAT', gl.HIGH_FLOAT],
+            ['LOW_INT', gl.LOW_INT],
+            ['MEDIUM_INT', gl.MEDIUM_INT],
+            ['HIGH_INT', gl.HIGH_INT]
+        ];
+        for (const [stName, stVal] of shaderTypes) {
+            for (const [pName, pVal] of precTypes) {
+                try {
+                    const fmt = gl.getShaderPrecisionFormat(stVal, pVal);
+                    if (fmt) {
+                        result[`${stName}_${pName}`] =
+                            `rangeMin=${fmt.rangeMin}, rangeMax=${fmt.rangeMax}, precision=${fmt.precision}`;
+                    }
+                } catch (e) {
+                    result[`${stName}_${pName}`] = 'エラー';
+                }
+            }
+        }
+        return result;
+    }
+
+    // =====================
+    // 実行ロジック
+    // =====================
+    async function runDiscriminativeTests() {
+        const result = {};
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64;
+            canvas.height = 64;
+            const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+            if (!gl) { result.error = "WebGL_Not_Available"; return result; }
+
+            result.renderer_raw = String(gl.getParameter(gl.RENDERER));
+            const dbgInfo = gl.getExtension('WEBGL_debug_renderer_info');
+            if (dbgInfo) {
+                result.unmasked_renderer_raw = String(gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL));
+            }
+
+            // ①基準テスト
+            let px = runShaderTest(gl, canvas, FS_BASELINE, VS_COMMON);
+            result.baseline_hash = await sha256Hex(px.buffer);
+            result.baseline_sample = `(0,0)=[${px[0]},${px[1]},${px[2]}]`;
+
+            // ②レンジリダクション暴露
+            px = runShaderTest(gl, canvas, FS_RANGE_REDUCTION, VS_COMMON);
+            result.range_reduction_hash = await sha256Hex(px.buffer);
+            result.range_reduction_sample = `(0,0)=[${px[0]},${px[1]},${px[2]}]`;
+
+            // ③誤差増幅(highp)
+            px = runShaderTest(gl, canvas, FS_AMPLIFIED, VS_COMMON);
+            result.amplified_hash = await sha256Hex(px.buffer);
+            result.amplified_sample = `(0,0)=[${px[0]},${px[1]},${px[2]}]`;
+
+            // ④mediump単独
+            px = runShaderTest(gl, canvas, FS_MEDIUMP_ONLY, VS_COMMON);
+            result.mediump_hash = await sha256Hex(px.buffer);
+            result.mediump_sample = `(0,0)=[${px[0]},${px[1]},${px[2]}]`;
+            result.mediump_vs_highp_differs = (result.mediump_hash !== result.amplified_hash);
+
+            // ⑤高速近似命令
+            px = runShaderTest(gl, canvas, FS_FAST_APPROX, VS_COMMON);
+            result.fast_approx_hash = await sha256Hex(px.buffer);
+            result.fast_approx_sample = `(0,0)=[${px[0]},${px[1]},${px[2]}]`;
+
+            // ⑥画面空間偏微分
+            const deriv = buildDerivativeShader(gl);
+            result.derivative_extension_available = deriv.available;
+            if (deriv.available) {
+                px = runShaderTest(gl, canvas, deriv.source, VS_COMMON);
+                result.derivative_hash = await sha256Hex(px.buffer);
+                result.derivative_sample = `(0,0)=[${px[0]},${px[1]},${px[2]}]`;
+            } else {
+                result.derivative_hash = "拡張機能未対応";
+            }
+
+            // ⑦テクスチャサンプリング
+            const tex = createSmallNoiseTexture(gl);
+            px = runShaderTest(gl, canvas, FS_TEXTURE_SAMPLE, VS_COMMON, (gl2, program) => {
+                gl2.activeTexture(gl2.TEXTURE0);
+                gl2.bindTexture(gl2.TEXTURE_2D, tex);
+                const loc = gl2.getUniformLocation(program, 'uTex');
+                if (loc) gl2.uniform1i(loc, 0);
+            });
+            result.texture_sample_hash = await sha256Hex(px.buffer);
+            result.texture_sample_sample = `(0,0)=[${px[0]},${px[1]},${px[2]}]`;
+
+            // ⑧反復増幅パス
+            px = runShaderTest(gl, canvas, FS_ITERATIVE, VS_COMMON);
+            result.iterative_hash = await sha256Hex(px.buffer);
+            result.iterative_sample = `(0,0)=[${px[0]},${px[1]},${px[2]}]`;
+
+            // ⑨highp / mediump 完全対比較
+            px = runShaderTest(gl, canvas, FS_PRECISION_COMPARE_HIGHP, VS_COMMON);
+            result.precision_compare_highp_hash = await sha256Hex(px.buffer);
+            result.precision_compare_highp_sample = `(0,0)=[${px[0]},${px[1]},${px[2]}]`;
+
+            px = runShaderTest(gl, canvas, FS_PRECISION_COMPARE_MEDIUMP, VS_COMMON);
+            result.precision_compare_mediump_hash = await sha256Hex(px.buffer);
+            result.precision_compare_mediump_sample = `(0,0)=[${px[0]},${px[1]},${px[2]}]`;
+
+            result.precision_compare_differs =
+                (result.precision_compare_highp_hash !== result.precision_compare_mediump_hash);
+
+            // 精度フォーマット直接クエリ
+            result.precision_info = getPrecisionInfo(gl);
+
+            // 総合ハッシュ (全テストのハッシュを連結してSHA-256)
+            const parts = [
+                result.baseline_hash,
+                result.range_reduction_hash,
+                result.amplified_hash,
+                result.mediump_hash,
+                result.fast_approx_hash,
+                typeof result.derivative_hash === 'string' ? result.derivative_hash : '',
+                result.texture_sample_hash,
+                result.iterative_hash,
+                result.precision_compare_highp_hash,
+                result.precision_compare_mediump_hash
+            ].filter(Boolean).join('|');
+            const enc = new TextEncoder();
+            result.overall_hash = await sha256Hex(enc.encode(parts));
+
+        } catch (e) {
+            result.error = e.message;
+        }
+        return result;
+    }
+
+    const log = [];
+    const outputEl = document.getElementById('output');
+
+    async function runTestAndDisplay(note, repeats=1, delayMs=150) {
+        log.length = 0;
+        for (let i=0;i<repeats;i++){
+            const r = await runDiscriminativeTests();
+            r.note = repeats===1 ? note : `${note} (${i+1}/${repeats})`;
+            r.ts = (new Date()).toISOString();
+            log.push(r);
+            if (i < repeats-1) await new Promise(res => setTimeout(res, delayMs));
+        }
+        renderOutput();
+    }
+
+    function renderOutput() {
+        let outputText = `--- ${document.title} ---`;
+        log.forEach((entry, index) => {
+            outputText += `\n\n[${index + 1}] ${entry.note}\n`;
+            outputText += `  日時: ${entry.ts}\n`;
+            if (entry.error) {
+                outputText += `  エラー: ${entry.error}\n`;
+                return;
+            }
+            outputText += `  RENDERER(生): ${entry.renderer_raw}\n`;
+            outputText += `  UNMASKED_RENDERER(生): ${entry.unmasked_renderer_raw}\n`;
+            outputText += `  --- ①基準テスト(従来のsin/cos) ---\n`;
+            outputText += `    Hash: ${entry.baseline_hash}\n`;
+            outputText += `    Sample: ${entry.baseline_sample}\n`;
+            outputText += `  --- ②レンジリダクション暴露(巨大な引数) ---\n`;
+            outputText += `    Hash: ${entry.range_reduction_hash}\n`;
+            outputText += `    Sample: ${entry.range_reduction_sample}\n`;
+            outputText += `  --- ③誤差増幅(fract×大きな係数, highp) ---\n`;
+            outputText += `    Hash: ${entry.amplified_hash}\n`;
+            outputText += `    Sample: ${entry.amplified_sample}\n`;
+            outputText += `  --- ④誤差増幅(同上, mediump) ---\n`;
+            outputText += `    Hash: ${entry.mediump_hash}\n`;
+            outputText += `    Sample: ${entry.mediump_sample}\n`;
+            outputText += `    highpとmediumpで結果が違う: ${entry.mediump_vs_highp_differs}\n`;
+            outputText += `  --- ⑤高速近似命令(pow/exp/inversesqrt) ---\n`;
+            outputText += `    Hash: ${entry.fast_approx_hash}\n`;
+            outputText += `    Sample: ${entry.fast_approx_sample}\n`;
+            outputText += `  --- ⑥画面空間偏微分(dFdx/dFdy) ---\n`;
+            outputText += `    拡張機能対応: ${entry.derivative_extension_available}\n`;
+            outputText += `    Hash: ${entry.derivative_hash}\n`;
+            if (entry.derivative_sample) outputText += `    Sample: ${entry.derivative_sample}\n`;
+            outputText += `  --- ⑦テクスチャサンプリング ---\n`;
+            outputText += `    Hash: ${entry.texture_sample_hash}\n`;
+            outputText += `    Sample: ${entry.texture_sample_sample}\n`;
+            outputText += `  --- ⑧反復増幅パス ---\n`;
+            outputText += `    Hash: ${entry.iterative_hash}\n`;
+            outputText += `    Sample: ${entry.iterative_sample}\n`;
+            outputText += `  --- ⑨精度比較(highp vs mediump) ---\n`;
+            outputText += `    Highp Hash: ${entry.precision_compare_highp_hash}\n`;
+            outputText += `    Highp Sample: ${entry.precision_compare_highp_sample}\n`;
+            outputText += `    Mediump Hash: ${entry.precision_compare_mediump_hash}\n`;
+            outputText += `    Mediump Sample: ${entry.precision_compare_mediump_sample}\n`;
+            outputText += `    highpとmediumpで結果が違う(精度比較): ${entry.precision_compare_differs}\n`;
+            outputText += `  --- シェーダー精度フォーマット(直接クエリ) ---\n`;
+            if (entry.precision_info) {
+                for (const [k,v] of Object.entries(entry.precision_info)) {
+                    outputText += `    ${k}: ${v}\n`;
+                }
+            }
+            outputText += `  --- 総合ハッシュ(overall_hash) ---\n`;
+            outputText += `    overall_hash: ${entry.overall_hash}\n`;
+        });
+        outputEl.innerText = outputText;
+    }
+
+    document.getElementById('run1').addEventListener('click', () => runTestAndDisplay('Single Measurement', 1));
+    document.getElementById('run3').addEventListener('click', () => runTestAndDisplay('Triple Measurement', 3, 250));
+    document.getElementById('copy').addEventListener('click', async () => {
+        const text = outputEl.innerText;
+        if (!navigator.clipboard) {
+            alert('クリップボードAPIがサポートされていません。手動でコピーしてください。');
+            return;
+        }
+        try {
+            await navigator.clipboard.writeText(text);
+            alert('測定結果をクリップボードにコピーしました！');
+        } catch (e) {
+            alert('コピーに失敗しました。');
+        }
+    });
+    </script>
+</body>
+</html>
